@@ -5,6 +5,7 @@ This is a TV show scheduler -- it has a "cron" job mode that can scrape (from ep
 Install:
 
 cp shows /usr/local/bin
+
 chmod 755 /usr/local/bin/shows
 
 Run:
@@ -22,6 +23,7 @@ to edit the last-viewed-config (LVC)
 Create a file called '/etc/cron.d/runshows' that looks like this:
 
 SHELL=/bin/bash
+
 0 2 * * 1,3,5  root	/usr/local/bin/shows --bail --probe > /tmp/last-shows-runtime-out.txt 2>&1
 
 

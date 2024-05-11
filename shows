@@ -1,0 +1,912 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use POSIX;
+use IO::File;
+use IO::Handle;
+use Getopt::Long;
+use File::Spec::Functions;
+use Time::HiRes    qw(usleep);
+use Time::Local    qw(timelocal);
+use File::Path     qw(make_path);
+use File::Basename;
+use File::Temp;
+
+use LWP::UserAgent;
+use HTTP::Request;
+use HTTP::Date;
+use HTML::Entities;
+use LWP::Protocol::https;
+
+our $VERSION = "1.15";
+
+use constant WEBSITE_URL        => 'https://epguides.com';
+use constant MY_SHOW_DATAFILE   => '/var/lib/shows/data.asc';
+use constant MY_LAST_SCHEDULE   => '/var/lib/shows/schedule.asc';
+use constant CACHE_DIR          => '/var/lib/shows/cache';
+use constant DEFAULT_EDITOR     => '/usr/bin/vi';
+use constant KINDNESS_FACTOR    => 120;
+
+autoflush STDOUT 1;
+
+my ($opt_help, $opt_probe, $opt_dump, $opt_edit, $opt_full, $opt_keys, $opt_resolve, $opt_auto, $opt_init, $opt_list, $opt_kind, $opt_bail, $opt_search);
+my $agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/102.0.5005.63 Safari/537.36';
+my $ua    = LWP::UserAgent->new( agent => $agent, timeout => 60 );
+
+Getopt::Long::Configure ("bundling", "no_ignore_case");
+GetOptions(
+    "h|help"            => \$opt_help,
+    "b|bail"            => \$opt_bail,
+    "p|probe"           => \$opt_probe,
+    "e|edit"            => \$opt_edit,
+    "f|full"            => \$opt_full,
+    "d|dump"            => \$opt_dump,
+    "s|search"          => \$opt_search,
+    "k|keys"            => \$opt_keys,
+    "K|kind=s"          => \$opt_kind,
+    "r|resolve=s"       => \$opt_resolve,
+    "a|auto"            => \$opt_auto,
+    "i|init"            => \$opt_init,
+    "l|list=s"          => \$opt_list,
+    "v|version"         => sub { printf STDOUT "%s v%s\n", basename($0), $VERSION; exit(0) },
+) || ++$opt_help;
+usage(-1) if $opt_help;
+
+$opt_kind ||= ( KINDNESS_FACTOR );
+$opt_kind *=  1_000_000;
+
+warn(sprintf("Warning: The --auto option has no effect when used with --resolve; note that the --resolve option is in effect.\n"))
+    if ($opt_resolve && $opt_auto);
+warn(sprintf("Warning: The --full switch only applies when combined with the --probe option.\n"))
+    if ($opt_full && !( $opt_probe ));
+warn(sprintf("Warning: The --search switch nullifies the effect of the --probe and --keys options.\n"))
+    if ($opt_search && ( $opt_probe || $opt_keys ));
+
+if ($opt_search) {
+    $opt_dump  = 1;
+    $opt_probe = 0;
+    $opt_keys  = 0;
+}
+
+exit(main(@ARGV));
+
+sub main {
+    my @matches    = @_;
+    my @showlist   = ();
+    my $queried    = 0;
+    my $found_new  = 0;
+
+    ##
+    ## If we only have one match to lookup don't pause a long time afterwards
+    $opt_kind = 1_000_000 if (scalar(@matches) == 1);
+
+    ##
+    ## Run the initial setup if --init is used.
+    ##
+    if ($opt_init) {
+        _init(MY_SHOW_DATAFILE);
+        printf STDOUT "Initialization done!\n\n"; 
+        printf STDOUT "To setup your shows:\n";
+        printf STDOUT "1) Run this script with the --list option to see a complete show listing from the listing provider\n";
+        printf STDOUT "2) Manually edit the last-viewed configuration file (LVC) and add shows to your setup by running this program with --edit, then\n";
+        printf STDOUT "3) Probe the listing provider and build a TV schedulw by running this program with the --probe switch, then\n";
+        printf STDOUT "4) Run the script with --dump to see your TV schedule anytime.\n\n";
+        printf STDOUT "(Create a cron job to do step 3 every morning at 4am)\n\n";
+        exit(0);
+    }
+
+    ##
+    ## Initial sanity checks
+    ##
+    my $init_check = _init_check(MY_SHOW_DATAFILE, MY_LAST_SCHEDULE);
+
+    ##
+    ## If the user wants a listing provider data dump, provide it.
+    ##
+    if ($opt_list) {
+        write_listing($opt_list);
+        exit(0);
+    }
+
+    ##
+    ## Load the current show listings no matter what
+    ##
+    my $last_sched = load_sched(MY_LAST_SCHEDULE);
+
+    ##
+    ## If auto-resolving LVC...
+    ##
+    if ($opt_resolve || $opt_auto) {
+        my @resolves = ();
+        if ($opt_resolve) {
+            @resolves = map { lc } grep { $_ && $_ !~ /^[\s,]+$/ } split( /\s*,\s*/, $opt_resolve );
+        }
+        else {
+            @resolves = show_sched($last_sched, 1);
+        }
+        if (@resolves) {
+            my $changed = resolve_data(\@resolves, $last_sched);
+            if ($changed) {
+                ##
+                ## Re-load the LVC file now that it's changed, and auto-update the schedule too.
+                ##
+                my $data   = load_data(MY_SHOW_DATAFILE);
+                $found_new = reconcile_data($last_sched, $data);
+            }
+        }
+        else {
+            printf STDOUT "No available shows exist in the current schedule to resolve.\n";
+        }
+        exit(0) unless ($opt_dump);
+    }
+
+    ##
+    ## If manually editing LVC...
+    ##
+    if ($opt_edit) {
+        my $editor = $ENV{EDITOR} || DEFAULT_EDITOR;
+        my $cmd    = sprintf('%s %s', $editor, MY_SHOW_DATAFILE);
+        system($cmd);
+        my ($status) = $?;
+        unless ($status) {
+            my $data   = load_data(MY_SHOW_DATAFILE);
+            $found_new = reconcile_data($last_sched, $data);
+        }
+        exit(0);
+    }
+
+    ##
+    ## Just display the current show listing if requested
+    ##
+    if ($opt_dump) {
+        if ($opt_probe) {
+            my $lastdata  = load_data(MY_SHOW_DATAFILE);
+            show_data($lastdata) if ($lastdata);
+        }
+        else {
+            show_sched($last_sched, 0) if ($last_sched);
+        }
+        return(0);
+    }
+
+    ##
+    ## Load the show data
+    ##
+    my $lastdata  = load_data(MY_SHOW_DATAFILE);
+
+    SHOW: for my $show (@{ $lastdata }) {
+        next SHOW if ( scalar(@matches) && !( has_a_match($show->[0], \@matches) ) );
+        my $next_show = lookup_show_exact($show, $opt_probe);
+        unless ($next_show) {
+            printf("Error: %-42s: Either no episodes have aired yet, or there was a failure reading data from the listing provider.\e[K\n", $show->[0]);
+            exit(-1) if $opt_bail; 
+            next SHOW;
+        }
+
+        ##
+        ## Print a little status output thingy to the console to keeep user interested
+        ##
+        printf(
+            "%-42s Next:%s (Newest episode %s)%s\e[K\r",
+            $show->[0],
+            $next_show->[0],
+            nice_date($next_show->[1]),
+            $next_show->[2] ? " (cached)" : "",
+        );
+
+        ##
+        ## Save the info, we'll reprint at the end, sorted in air date sequence
+        ##
+        my $result    = $next_show->[0] ne $show->[2];
+        ++$queried;
+        if ( $result ) {
+            ++$found_new;
+            push @showlist, [ $show->[0], $next_show->[0], $next_show->[1], $show->[1] ];
+        }
+
+        ##
+        ## Sleep between iterations to be nice to epguides.com
+        ##
+        usleep($opt_kind);
+    }
+
+    ##
+    ## Print out all fancy in order
+    ##
+    printf("\e[K");
+    @showlist = sort {
+           $a->[2] <=> $b->[2]
+        || $a->[0] cmp $b->[0]
+    } @showlist;
+
+    if (scalar(@showlist)) {
+        ##
+        ## Show all the listings if we're just viewing today's listing, or if we're showing the full schedule
+        ##
+        if (!( $opt_probe ) || $opt_full ) {
+            my $today = timelocal(0, 0, 0, (localtime)[3, 4, 5]);
+            print "Today's date is: ", nice_date(time, 1), "\n\n";
+            for my $show (@showlist) {
+                my $line = sprintf("%-42s:%s:%s%s",
+                    $show->[0],
+                    nice_date($show->[2]),
+                    $show->[1],
+                    ( $today >= $show->[2] ) ? " (Now available)" : "",
+                );
+                $line .= ':' . $show->[3] if ($opt_keys);
+                print STDOUT "$line", "\n";
+            }
+            printf("\n");
+            ##
+            ## Print summary statistics
+            ##
+            printf(
+                "I looked up %s show%s and found %s new episode%s (use --dump to see the schedule)\n",
+                $queried, ($queried) == 1 ? "" : "s",
+                $found_new, ($found_new) == 1 ? "" : "s",
+            );
+        }
+        ##
+        ## Otherwise we'll show a delta of the shows compared to the last schedule
+        ##
+        else {
+            my $sched_diff = delta_sched($last_sched, \@showlist);
+            my $changes = scalar(keys %{ $sched_diff });
+            if ($changes) {
+                printf("There were %s schedule change%s as of %s\n\n",
+                    $changes,
+                    ($changes) == 1 ? "" : "s",
+                    nice_date(time, 1),
+                );
+                my @sorted_diff = sort {
+                       $sched_diff->{$a}->[2] <=> $sched_diff->{$b}->[2]
+                    || $sched_diff->{$a}->[0] cmp $sched_diff->{$b}->[0]
+                } keys %{ $sched_diff };
+                for my $diff ( @sorted_diff ) {
+                    printf("%-42s:%s:%s\n",
+                        $sched_diff->{$diff}->[0],
+                        nice_date($sched_diff->{$diff}->[2]),
+                        $sched_diff->{$diff}->[1],
+                    );
+                }
+                printf("\n");
+            }
+            else {
+                printf("No changes occurred in the schedule -- ");
+            }
+            printf("Run this script with the --dump switch to see the current schedule.\n");
+        }
+    }
+    else {
+        printf("No listings to display as of %s\n", nice_date(time, 1)) unless ($opt_probe);
+    }
+
+    ##
+    ## Only write the schedule to disk if we're asking for a full schedule (no show matches)
+    ##
+    write_schedule(MY_LAST_SCHEDULE, \@showlist) if ($opt_probe && !( scalar(@matches) ));
+
+    return(0);
+}
+
+sub write_listing {
+    my ($outf) = @_;
+    my $output = undef();
+    my %shows  = ();
+    return unless ($outf);
+    
+    ##
+    ## Attempt to write the output file at the very beginning, because if we can't write to the file
+    ## it's better to get an error at the very beginning, rather than read all of the listing data from
+    ## the web provider and then have no place to write it.
+    ##
+    my $outfh = IO::File->new("> $outf");
+    die(sprintf("Error: Could not write output to '%s': %s\n", $outf, $!))
+        unless $outfh;
+
+    for my $tok ( 'a' .. 'z' ) {
+        my $t_name = sprintf("menu%s", $tok);
+        printf STDOUT "Reading %s/%s/ ...\e[K\r", WEBSITE_URL, $t_name;
+        my $f_out  = fetch_url($t_name);
+        if ($f_out) {
+            $output = $f_out->[0];
+            if ($output) {
+                parse_listing($output, \%shows);
+            }
+        }
+
+        ##
+        ## Sleep between iterations to be nice to epguides.com
+        ##
+        usleep($opt_kind);
+    }
+
+    print "done.\e[K\n";
+
+    print $outfh "#\n";
+    print $outfh "# Format:\n";
+    print $outfh "#\n";
+    print $outfh "# listing_key:Show name\n";
+    print $outfh "#\n";
+    for my $key (sort { $a cmp $b } keys %shows) {
+        printf $outfh "%s:%s\n", $key, $shows{$key};
+    }
+    $outfh->close();
+    printf STDOUT "Wrote output to '%s'\n", $outf;
+    return;
+}
+
+sub parse_listing {
+    my ($output, $show_hash) = @_;
+    for my $out (@{ $output }) {
+        if ($out =~ m{^<li><b><a href="\.\./([^/]+)/">([^<]+)</a></b></li>$}i) {
+            my ($key, $show)    = ( $1, $2 );
+            my $dkey            =  lc(decode_entities($key));
+            my $dshow           =  decode_entities($show);
+            $dshow              =~ tr/://d;
+            $show_hash->{$dkey} = $dshow;
+        }
+    }
+    return;
+}
+
+sub resolve_data {
+    my ($resolves, $sched) = @_;
+    return unless ( $resolves && $sched );
+    my $datafile = MY_SHOW_DATAFILE;
+    my $count    = 0;
+    my $modhash  = { map { $_, $sched->{$_} } grep { $sched->{$_} } @{ $resolves } };
+    my $valids   = scalar(keys %{ $modhash });
+    unless ($valids) {
+        warn(
+            sprintf(
+                "Error: None of the keys specified '%s' are in the current schedule (use --dump with --keys to see the schedule).\n",
+                join( ', ' => @{ $resolves } ),
+            )
+        );
+        return(0);
+    }
+    my $fout = File::Temp->new(
+        DIR         => dirname($datafile),
+        TEMPLATE    => ".showsXXXXXX",
+        UNLINK      => 0,
+    ) || do {
+        warn(sprintf("Error: Could not create temporary file in directory '%s' [%s]\n", dirname($datafile), $!));
+        return(0);
+    };
+    my $fin = IO::File->new("< $datafile");
+
+    while (my $line = <$fin>) {
+        chomp($line);
+        if ($line =~ /^\s*#|^$/) {
+            print $fout $line, "\n";
+            next;
+        }
+        my @terms = split(/:/, $line, 3);
+        my $key   = lc( $terms[1] );
+        if (exists( $modhash->{$key} )) {
+            printf STDOUT "Auto-update LVC for '%s'\n", $terms[0];
+            printf $fout "%s:%s:%s\n", $terms[0], $key, $modhash->{$key}->[1];
+        }
+        else {
+            ##
+            ## Otherwise just write out whatever we read in, don't change anything in the file (comments, etc).
+            ##
+            print $fout $line, "\n";
+        }
+    }
+    $fin->close();
+    $fout->close();
+    my @f_in_stat = stat($datafile);
+    chown @f_in_stat[4, 5], $fout->filename;
+    chmod $f_in_stat[2], $fout->filename;
+    unless (rename( $fout->filename, $datafile )) {
+        warn(sprintf("Error: Was not able to move temp file '%s' to the last-viewed configuration file '%s'\n", $fout->filename, $datafile));
+        return(0);
+    }
+    return $valids;
+}
+
+sub show_data {
+    my ($data) = @_;
+    return unless ( $data && ref($data) eq 'ARRAY' );
+    my $last_data = (stat MY_SHOW_DATAFILE)[ 9 ];
+    printf("Today's date is         : %s\nLast show listing update: %s\n\n", nice_date(time, 1), nice_date($last_data, 1));
+    for my $dent (sort { $a->[0] cmp $b->[0] } @{ $data }) {
+        my $line = sprintf("%-42s:%s", $dent->[0], $dent->[2]);
+        $line .= ':' . $dent->[1] if ($opt_keys);
+        print STDOUT "$line", "\n";
+    }
+    return;
+}
+
+sub reconcile_data {
+    my ($sched, $data) = @_;
+    my @showlist       = ();
+    my $changed        = 0;
+
+    ##
+    ## It's faster to make one hash based on an array of data and use that for lookups than it is to repeatedly iterate over an array
+    ## each time (e.g., even using List::Util::first) you perform a data lookup.
+    ##
+    my $data_lookup = { map { ( $_->[1], 1 ) } @{ $data } };
+
+    ##
+    ## Iterate over all of the available shows.
+    ##
+    for my $ele (@{ $data }) {
+        my $key   = $ele->[1];
+        ##
+        ## If we find a show that's on the schedule, then lets see if the episode was changed in the edit.
+        ##
+        if ( exists ($sched->{$key}) ) {
+            my $seq_a = show_seq($sched->{$key}->[1]);
+            my $seq_b = show_seq($ele->[2]);
+            if ($seq_b >= $seq_a) {
+                my $update = lookup_show_exact($ele, 1);
+                if ($update) {
+                    ##
+                    ## If the update says it's the same show that we just watched, and there's no 
+                    ## future episodes scheduled yet, then actually remove it from the current schedule.
+                    ##
+                    printf("Auto-update schedule for '%s'\e[K\n", $ele->[0]);
+                    if ($update->[0] eq $ele->[2]) {
+                        delete $sched->{$key};
+                        ++$changed;
+                    }
+                    else {
+                        $sched->{$key}->[1] = $update->[0];
+                        $sched->{$key}->[2] = $update->[1];
+                        ++$changed;
+                    }
+                }
+            }
+        }
+    }
+
+    ##
+    ## Iterate over all of the schedule listings and ensure they're still in the LVC
+    ##
+    for my $key ( sort keys %{ $sched } ) {
+        ##
+        # Check to see if the show was deleted from the LVC
+        ##
+        unless ( exists $data_lookup->{$key} ) {
+            printf("Remove schedule item '%s'\e[K\n", $sched->{$key}->[0]);
+            delete $sched->{$key};
+            ++$changed;
+        }
+    }
+
+    if ($changed) {
+        my @new_sched = sort { $a->[2] <=> $b->[2] } map { [ @{ $sched->{$_} }[ 0 .. 2 ], $_ ] } keys ( %{ $sched } );
+        write_schedule(MY_LAST_SCHEDULE, \@new_sched);
+        printf("Updated %s entr%s in the schedule.\n", $changed, ($changed==1) ? "y" : "ies");
+    }
+
+    return $changed;
+}
+
+sub delta_sched {
+    my ($last_sched, $curr_sched) = @_;
+    my %delta = ();
+    return \%delta unless ( $last_sched && ref($last_sched) eq 'HASH' && $curr_sched && ref($curr_sched) eq 'ARRAY');
+    for my $curr (@{ $curr_sched }) {
+        my $key = $curr->[3];
+        if (exists $last_sched->{$key}) {
+            ##
+            ## If the current schedule's episode number, or air date/time has changed, include it
+            if ($last_sched->{$key}->[1] ne $curr->[1] || $last_sched->{$key}->[2] ne $curr->[2]) {
+                $delta{$key} = [ @{ $curr }[ 0 .. 2 ] ];
+            }
+        }   
+        ##
+        ## The show doesn't exist in the last schedule, include it
+        else {
+            $delta{$key} = [ @{ $curr }[ 0 .. 2] ];
+        }
+    }
+    return \%delta;
+}
+
+sub write_schedule {
+    my ($outfile, $showlist) = @_;
+    return unless ($outfile && $showlist && ref($showlist) eq 'ARRAY' && scalar(@$showlist));
+
+    my $fh = IO::File->new("> $outfile");
+    unless ($fh) {
+        warn(sprintf("Error: Couldn't write to file '%s': %s\n", $outfile, $!));
+        return;
+    }
+    for my $show (@{ $showlist }) {
+        printf $fh "%s:%s:%s:%s\n", @{ $show }[ 3, 0, 1, 2 ];
+    }
+    $fh->close();
+    return;
+}
+
+sub has_a_match {
+    my ($string, $matches) = @_;
+    return unless ( $matches && ref($matches) eq 'ARRAY' && scalar(@$matches) );
+    for my $term (@{ $matches }) {
+        return 1 if ( $string =~ /\Q${term}\E/i );
+    }
+    return;
+}
+
+sub load_data {
+    my ($file) = @_;
+    return unless ($file && -f $file);
+    my @data = ();
+    my $fh = IO::File->new("< $file");
+    DATALINE: while (my $line = <$fh>) {
+        chomp($line);
+        next DATALINE if ($line =~ /^\s*#|^$/);
+        my @terms = split(/:/, $line, 3);
+        $terms[1] = lc $terms[1];
+        push @data, [ @terms ];
+    }
+    $fh->close();
+    return \@data;
+}
+
+sub fetch_url {
+    my ($name) = @_;
+
+    my $url   = sprintf('%s/%s/', WEBSITE_URL, $name);
+    my $req   = HTTP::Request->new( GET => $url );
+    my ( $resp );
+
+    my $mtime = cache_mtime($name);
+    $req->push_header( 'If-Modified-Since' => time2str($mtime) )
+        if ($mtime);
+
+    $resp = $ua->request($req);
+    return unless $resp;
+
+    my $code = $resp->code;
+    if ($code eq '304') {
+        my $out   = cache_contents($name);
+        return [ $out, 1 ];
+    }
+    elsif ($code eq '200') {
+        update_cache($name, $resp->content);
+        my @out   = split /\r?\n/, $resp->content;
+        chomp(@out);
+        return [ \@out, 0 ];
+    }
+
+    return;
+}
+
+sub cache_file {
+    my ($name) = @_;
+    return unless $name;
+    my $path   = catfile(CACHE_DIR, $name);
+    return $path;
+}
+
+sub cache_contents {
+    my ($name) = @_;
+    return unless $name;
+    my $path   = cache_file($name);
+    my $fh = IO::File->new("< $path");
+    my @out = <$fh>;
+    $fh->close();
+    chomp(@out);
+    return \@out;
+}
+
+sub cache_mtime {
+    my ($name) = @_;
+    my $path   = cache_file($name);
+    return unless -f $path;
+    my $mtime  = (stat $path)[9];
+    return $mtime;
+}
+
+sub update_cache {
+    my ($name, $content) = @_;
+    my $path = cache_file($name);
+    my $fh   = IO::File->new("> $path");
+    return unless $fh;
+    print $fh $content;
+    $fh->close();
+    return;
+}
+
+sub lookup_show_exact {
+    my ($show, $scheduled) = @_;
+    return unless ( ref($show) eq 'ARRAY' && scalar(@$show) );
+    my ($curr_seas, $curr_epis, $curr_time, $curr_seep, $last_seep, $last_time);
+    my $today          = timelocal(0, 0, 0, (localtime)[3, 4, 5]);
+    my $last_watched   = $show->[2];
+    my ($out, $cached) = ( [], 0 );
+
+    ##
+    ## Fetch the show data
+    ##
+    my $fetch_result;
+    my $tries = 0;
+    my $max_tries = 15;
+    TRIES: while ($tries++ < $max_tries) {
+        $fetch_result  = fetch_url($show->[1]);
+        last TRIES if $fetch_result;
+        if ($tries < $max_tries) {
+            printf("Re-trying %s... (try #%d)\e[K\n", $show->[0], $tries);
+            usleep($opt_kind + (($tries - 1) * 1_000_000));
+        }
+    }
+    ($out, $cached)    = @{ $fetch_result } if ($fetch_result);
+
+    LINE: for my $line (@{ $out }) {
+        #
+        # Get rid of this stupid &nbsp; crap:
+        $line =~ s/&nbsp;/ /msg;
+
+        # 
+        # The "season" identifier line can look like any of the following:
+        #
+        # <tr><td colspan='7' class='bold'>Season 3</td></tr>
+        # <tr><td colspan='7' class='bold'><div id="latest"></div>Season 4</td></tr>
+        #
+        if ($line =~ /^<tr><td.*Season\s+(\d+)/) {
+            $curr_seas = $1;
+            # print "Found season identifier!: ", $curr_seas, "\n";
+            next LINE;
+        }
+        #
+        # The "episode" identifier line can look like any of the following:
+        #
+        # 1.     1-1                 24 Sep 10   <a target="_blank" href="https://www.tvmaze.com/episodes/6705/blue-bloods-1x01-pilot">Pilot</a>
+        # <tr><td class='epinfo right'>1.</td><td>&nbsp;</td><td class='epinfo left'>1-1</td><td>&nbsp;</td><td class='epinfo right'>08 Feb 15</td> ... </tr>
+        #
+        if ($line =~ /\d+-\d+.*\d+\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\s+\d+/i) {
+            $line =~ s/<[^>]+>/ /msg;
+            # print "Line: ", $line, "\n";
+            if ($line =~ /(S?\d+)\.\s+\d+-(\d+)\s+(\d+)\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\s+(\d+)/i) {
+                next LINE unless defined($curr_seas);
+
+                #
+                # This lets us skip the "Specials" TV listing section, not attached to a specific episode listing
+                #
+                my $ep_number = $1;
+                next LINE if ($ep_number =~ /^S/i);
+
+                $curr_epis = $2;
+                $curr_seep = sprintf("S%02dE%02d", $curr_seas, $curr_epis);
+    
+                ##
+                ## We convert the air date (DD MON YR) into an epoch
+                ##
+                my ($n_day, $s_mon, $n_year) = ($3, $4, $5);
+                $curr_time = calc_epoch($n_day, $s_mon, $n_year);
+    
+                if ($scheduled) {
+                    return [ $curr_seep, $curr_time ] if ($last_seep && $last_seep eq $last_watched);
+                }
+                else {
+    
+                    ##
+                    ## We found an episode that airs in the future, so we go back one episode, that was the last episode that aired
+                    ## If there wasn't a last episode it returns undef() which caller interprets appropriately (no aired episodes exist).
+                    ##
+                    if ($curr_time > $today) {
+                        return unless $last_seep;
+                        return [ $last_seep, $last_time ];
+                    }
+                }
+                $last_seep = $curr_seep;
+                $last_time = $curr_time;
+                next LINE;
+            }
+        }
+    }
+    return unless $curr_seep;
+    return [ $curr_seep, $curr_time, $cached ];
+}
+
+sub calc_epoch {
+    my ($n_day, $s_mon, $n_year) = @_;
+    ##
+    ## Some assumptions about the year. If the two year digits are 00-45, we assume 2000, otherwise 1900 century assumed.
+    ## (Earliest TV series shown on epguides.com starts in 1946)
+    ##
+    $n_year += ( $n_year < 46 ) ? 100 : 0;
+    my $n_mon = {jan=>0,feb=>1,mar=>2,apr=>3,may=>4,jun=>5,jul=>6,aug=>7,sep=>8,oct=>9,nov=>10,dec=>11}->{lc $s_mon} || 0;
+    my $tspec = timelocal(0, 0, 0, $n_day, $n_mon, $n_year);
+    return $tspec;
+}
+
+sub nice_date {
+    my ($epoch, $fmt) = @_;
+    return strftime( ($fmt) ? "%a %b-%d-%Y %H:%M:%S" : "%b-%d-%Y:%a", localtime($epoch));
+}
+
+sub load_sched {
+    my ($file) = @_;
+    my %sched  = ();
+    return \%sched unless ( $file &&  -f $file );
+
+    my $fh     = IO::File->new("< $file");
+
+    unless ($fh) {
+        warn(sprintf("Error: Could not open '%s' for reading: $!\n", $file, $!));
+        return;
+    }
+    while ((my $line = <$fh>)) {
+        chomp($line);
+        next if ( $line =~ /^\s*$|^\s*#/ );
+        my @items = split(/:/, $line, 4);
+        my $key      = lc shift(@items);
+        $sched{$key} = [ @items ];
+    }
+
+    return \%sched;
+}
+
+sub show_sched {
+    my ($sched, $just_keys) = @_;
+    return unless ($sched && ref($sched) eq 'HASH' && scalar(keys %{ $sched }));
+    my $today       = timelocal(0, 0, 0, (localtime)[3, 4, 5]);
+    my $last_update = (stat MY_LAST_SCHEDULE)[ 9 ];
+    my $num_shows   = scalar(keys %{ $sched });
+    my @keys        = ();
+    my $availctr    = 0;
+    printf("Today's date is     : %s\nLast schedule update: %s\n\n", nice_date(time, 1), nice_date($last_update, 1))
+        unless ( $just_keys );
+
+    my @sorted_sched = sort {
+           $sched->{$a}->[2] <=> $sched->{$b}->[2]
+        || $sched->{$a}->[0] cmp $sched->{$b}->[0]
+    } keys %{ $sched };
+    LIST_KEYS: for my $key ( @sorted_sched ) {
+        my $line   = '';
+        my $avail  = ( $today >= $sched->{$key}->[2] ) ? 1 : 0;
+        $availctr += $avail;
+        if ($opt_search) {
+            if ($avail) {
+                $line = sprintf("%s %s", $sched->{$key}->[0], $sched->{$key}->[1]);
+            }
+            else {
+                next LIST_KEYS;
+            }
+        }
+        else {
+            $line  = sprintf("%-42s:%s:%s%s",
+                $sched->{$key}->[0],
+                nice_date($sched->{$key}->[2]),
+                $sched->{$key}->[1],
+                ( $avail ) ? " (Now available)" : "",
+            );
+            $line .= ':' . $key if ($opt_keys);
+        }
+        print STDOUT "$line", "\n" unless ( $just_keys );
+        push @keys, $key if ( $avail );
+    }
+    print(STDOUT "\n") if ( ( !( $opt_search ) || $availctr ) && !( $just_keys ) );
+    printf(STDOUT "There %s %s show%s on the current schedule, and %s of them are available.\n",
+        ($num_shows==1) ? "is" : "are",
+        $num_shows,
+        ($num_shows==1) ? ""   : "s",
+        $availctr ? $availctr  : "none",
+    ) unless ( $just_keys );
+    return @keys;
+}
+
+sub show_seq {
+    my ($seep) = @_;
+    return 0 unless ($seep && $seep =~ /^S\d+E\d+/i);
+    my ($se, $ep) = $seep =~ /^S(\d+)E(\d+)/;
+    return ( ($se * 100) + $ep );
+}
+
+sub _init_check {
+    my ($datafile, $sched) = @_;
+    my $workdir            = dirname( $datafile );
+    die("Error: Currently this application requires privileged access (run as superuser)\n")
+        if ( $> );
+    die("Error: The initial setup has not been configured -- run this progarm with the --init flag before use.\n")
+        unless ( -d $workdir );
+    die(
+          "Error: No program schedule exists. Use the --list option to see the listing provider showlist and the --edit switch to add shows. "
+        . "Then then run this program with --probe to build a show schedule.\n"
+    ) if ( !( -f $sched ) && !( $opt_edit || $opt_probe || $opt_list ) );
+    return;
+}
+
+sub _init {
+    my ($datafile) = @_;
+    my $workdir    = dirname($datafile);
+    my $cachedir   = catdir($workdir, "cache");
+
+    ##
+    ## Create the working directories
+    ##
+    make_path( $workdir, { chmod => 0755 } );
+    make_path( $cachedir, { chmod => 01777 } );
+    for my $d ( $workdir, $cachedir ) {
+        die(sprintf("Error: Could not create directory '%s'\n", $d))
+            unless (-d $d);
+    }
+
+    ##
+    ## Don't clobber existing LVC...
+    ##
+    unless ( -f $datafile ) {
+        ##
+        ## Create a template LVC file
+        ##
+        my $fh         = IO::File->new("> $datafile");
+        my $contents   = undef();
+        if ($fh) {
+            local $/ = undef();
+            $contents = <DATA>;
+            print $fh $contents;
+            $fh->close();
+        }
+    }
+
+    return(0);
+}
+
+sub usage {
+    my ($exit_val) = @_;
+    my $bn = basename($0);
+    printf STDOUT "Usage:\n";
+    printf STDOUT "%s [OPTIONS]... [match args...]\n\n", $bn;
+    printf STDOUT "    -h, --help                      Display command line syntax (you're lookin' at it now!).\n";
+    printf STDOUT "    -v, --version                   Show current version.\n";
+    printf STDOUT "    -i, --init                      Create initial work directory and basic configuration files.\n";
+    printf STDOUT "    -l, --list=outfile              Write a complete show listing in key:showname format to the specified file.\n";
+    printf STDOUT "    -K, --kind=second(s)            Pause the given number of seconds between each query to the listing provider (defaults to 120).\n";
+    printf STDOUT "    -b, --bail                      Die with an error if there's an error parsing data from the listing provider (defaults to false).\n";
+    printf STDOUT "    -e, --edit                      Manually edit the last-viewed configuration [LVC] file (it's better to just use the --resolve or --auto options).\n";
+    printf STDOUT "    -p, --probe                     Probe the listing provider website for shows named in the LVC file for schedule changes and update the current schedule.\n";
+    printf STDOUT "    -f, --full                      When used with --probe shows the full schedule -- not just schedule changes.\n";
+    printf STDOUT "    -d, --dump                      Display the current schedule that was last updated with the --probe option paramenter.\n";
+    printf STDOUT "                                    When combined with --probe it shows the LVC table instead of the current schedule.\n";
+    printf STDOUT "                                    When combined with --auto (or --resolve) it resolves and then dumps the new schedule.\n";
+    printf STDOUT "                                    When combined with --search only episodes available are shown, and in a searchable string format.\n";
+    printf STDOUT "    -s, --search                    Automatically turns on --dump, and turns off --keys and --probe.  This option dumps available shows in a searchable format.\n";
+    printf STDOUT "    -k, --keys                      Include unique show identifier keys in any show output listing (keys are used by the --resolve option).\n";
+    printf STDOUT qq{    -r, --resolve=key1[,key2...]    Auto-update the LVC of shows identified by the (comma-delimited) key list as "caught-up" according to the current schedule.\n};
+    printf STDOUT qq{    -a, --auto                      Automatically resolve the LVC of ALL shows noted as "(Now Available)" in the current schedule (as seen with --dump).\n\n};
+    printf STDOUT "No arguments results in today's listing being queried and displayed.\n";
+    exit($exit_val);
+}
+
+__DATA__
+#
+# Data file Layout:
+#
+# Display-name:unique-show-keyname:current-season-and-episode
+#
+# Notes:
+#
+#   * Comments are obviously placed on a line and introduced with a hash character (#)
+#
+#   * There are three fields, each one is delimited with a semi-colon.  Because of this none of the data
+#     fields themselves may have a semi-colon in them (it would confuse the parser).
+#
+#   * The 'Display-name' argument is just a human readable string that represents the name of the show.  It
+#     may have spaces in the string if you like.
+#
+#   * The 'unique-show-keyname' must be the path component field at epguides.com for the show.  For example,
+#     the URL for the Muppets is "http://epguides.com/muppets/", which means that the unique string identifier
+#     of 'muppets' must be the 'unique-show-keyname' parameter.  Go to "https://epguides.com/" for all shows'
+#     index menu.
+#
+#   * The current-season-and-episode parameter must be in the form SzzEzz where 'zz' are zero-filled leading
+#     numeric digits representing the season and episode numbers respectively (e.g., "S01E01").  This field
+#     represents the last episode of the show you ever watched.  Watch the first episode and then use 'S01E01'
+#     as the current-season-and-episode parameter.
+#
+# Examples:
+#
+# World Of Ants:worldofants:S01E12
+# Saturday Night Live:SaturdayNightLive:S26E20
+# The Millionaire Matchmaker:MillionaireMatchmaker:S08E14
+#
